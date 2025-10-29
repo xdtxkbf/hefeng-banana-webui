@@ -20,3 +20,8 @@ __pycache__/
 # 忽略临时文件
 *.tmp
 *.temp
+
+# 忽略输入输出图像文件夹
+input/
+batch_outputs/
+input_cache/
