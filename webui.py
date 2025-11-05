@@ -51,6 +51,10 @@ all_output_files_lock = threading.Lock()
 image_metadata = {}  # {output_path: {source_image, prompt, model, aspect_ratio, ...}}
 image_metadata_lock = threading.Lock()
 
+# 任务中止控制
+task_group_cancel_flags = {}
+task_group_cancel_lock = threading.Lock()
+
 # URL缓存：避免重复上传相同图像
 upload_cache = {}  # {file_path: cdn_url}
 upload_cache_lock = threading.Lock()
@@ -62,6 +66,43 @@ def get_api_key_for_task(task_id: int, all_keys: List[str]) -> str:
         raise ValueError("没有可用的API密钥")
     key_index = (task_id - 1) % len(all_keys)
     return all_keys[key_index]
+
+
+def register_task_group_for_cancel(group_id: str):
+    """注册任务组以支持中止控制"""
+    with task_group_cancel_lock:
+        task_group_cancel_flags[group_id] = False
+
+
+def clear_task_group_cancel_flag(group_id: str):
+    """任务结束后清理中止标记"""
+    with task_group_cancel_lock:
+        task_group_cancel_flags.pop(group_id, None)
+
+
+def is_task_group_cancelled(group_id: str) -> bool:
+    """检测任务组是否已请求中止"""
+    with task_group_cancel_lock:
+        return task_group_cancel_flags.get(group_id, False)
+
+
+def request_cancel_all_tasks() -> List[str]:
+    """标记所有任务组为已请求中止，返回受影响的任务组ID列表"""
+    with task_group_cancel_lock:
+        targets = list(task_group_cancel_flags.keys())
+        for gid in targets:
+            task_group_cancel_flags[gid] = True
+    if not targets:
+        return []
+
+    with task_groups_lock:
+        for gid in targets:
+            if gid in task_groups:
+                logs = task_groups[gid].get('log', [])
+                logs.append("⛔ 用户请求中止任务")
+                task_groups[gid]['log'] = logs
+                task_groups[gid]['status'] = "⛔ 已请求中止"
+    return targets
 
 
 def process_single_task(
@@ -257,6 +298,12 @@ def process_task_group_async(
         
         log_messages = []
         log_messages.append(f"🚀 任务组 {group_id[:8]}: {len(image_files)} 图像 × {len(prompts)} 提示词")
+        if is_task_group_cancelled(group_id):
+            log_messages.append("⛔ 任务已在开始前被中止")
+            with task_groups_lock:
+                task_groups[group_id]['status'] = "⛔ 用户已中止"
+                task_groups[group_id]['log'] = log_messages.copy()
+            return
         
         # ========== 阶段1: 上传图像 ==========
         upload_results = {}  # {image_path: (cdn_url, upload_time)}
@@ -287,6 +334,13 @@ def process_task_group_async(
                 with task_groups_lock:
                     task_groups[group_id]['upload_progress'] = f"{upload_completed}/{len(image_files)}"
                     task_groups[group_id]['log'] = log_messages.copy()
+
+                if is_task_group_cancelled(group_id):
+                    log_messages.append("⛔ 上传阶段已中止")
+                    with task_groups_lock:
+                        task_groups[group_id]['status'] = "⛔ 用户已中止"
+                        task_groups[group_id]['log'] = log_messages.copy()
+                    return
         
         if not upload_results:
             with task_groups_lock:
@@ -294,6 +348,12 @@ def process_task_group_async(
             return
         
         log_messages.append(f"✅ 上传完成: {len(upload_results)}/{len(image_files)}")
+        if is_task_group_cancelled(group_id):
+            log_messages.append("⛔ 上传完成后任务被中止")
+            with task_groups_lock:
+                task_groups[group_id]['status'] = "⛔ 用户已中止"
+                task_groups[group_id]['log'] = log_messages.copy()
+            return
         
         # ========== 阶段2: 调用API ==========
         with task_groups_lock:
@@ -366,6 +426,13 @@ def process_task_group_async(
                 with task_groups_lock:
                     task_groups[group_id]['api_progress'] = f"{api_completed}/{total_api_tasks}"
                     task_groups[group_id]['log'] = log_messages.copy()
+
+                if is_task_group_cancelled(group_id):
+                    log_messages.append("⛔ API调用阶段已中止")
+                    with task_groups_lock:
+                        task_groups[group_id]['status'] = "⛔ 用户已中止"
+                        task_groups[group_id]['log'] = log_messages.copy()
+                    return
         
         # 统计结果
         success_count = sum(1 for r in api_results if r['success'])
@@ -378,6 +445,8 @@ def process_task_group_async(
         with task_groups_lock:
             task_groups[group_id]['status'] = f"❌ 异常: {str(e)}"
             task_groups[group_id]['log'].append(f"❌ 异常: {str(e)}")
+    finally:
+        clear_task_group_cancel_flag(group_id)
 
 
 def process_multi_group_async(
@@ -424,6 +493,12 @@ def process_multi_group_async(
     try:
         log_messages = []
         log_messages.append(f"🚀 任务组 {group_id[:8]}: {total_images} 图像（来自{len(page_images_dict)}页）× {len(prompts)} 提示词")
+        if is_task_group_cancelled(group_id):
+            log_messages.append("⛔ 任务已在开始前被中止")
+            with task_groups_lock:
+                task_groups[group_id]['status'] = "⛔ 用户已中止"
+                task_groups[group_id]['log'] = log_messages.copy()
+            return
         
         # ========== 阶段1: 上传所有图像 ==========
         
@@ -453,6 +528,13 @@ def process_multi_group_async(
                 with task_groups_lock:
                     task_groups[group_id]['upload_progress'] = f"{upload_completed}/{len(all_images)}"
                     task_groups[group_id]['log'] = log_messages.copy()
+
+                if is_task_group_cancelled(group_id):
+                    log_messages.append("⛔ 上传阶段已中止")
+                    with task_groups_lock:
+                        task_groups[group_id]['status'] = "⛔ 用户已中止"
+                        task_groups[group_id]['log'] = log_messages.copy()
+                    return
         
         if not upload_results:
             with task_groups_lock:
@@ -460,6 +542,12 @@ def process_multi_group_async(
             return
         
         log_messages.append(f"✅ 上传完成: {len(upload_results)}/{len(all_images)}")
+        if is_task_group_cancelled(group_id):
+            log_messages.append("⛔ 上传完成后任务被中止")
+            with task_groups_lock:
+                task_groups[group_id]['status'] = "⛔ 用户已中止"
+                task_groups[group_id]['log'] = log_messages.copy()
+            return
         
         # ========== 阶段2: 调用API（所有图像作为一组） ==========
         with task_groups_lock:
@@ -547,6 +635,13 @@ def process_multi_group_async(
                 with task_groups_lock:
                     task_groups[group_id]['api_progress'] = f"{api_completed}/{total_api_tasks}"
                     task_groups[group_id]['log'] = log_messages.copy()
+
+                if is_task_group_cancelled(group_id):
+                    log_messages.append("⛔ API调用阶段已中止")
+                    with task_groups_lock:
+                        task_groups[group_id]['status'] = "⛔ 用户已中止"
+                        task_groups[group_id]['log'] = log_messages.copy()
+                    return
         
         success_count = sum(1 for r in api_results if r['success'])
         
@@ -558,12 +653,14 @@ def process_multi_group_async(
         with task_groups_lock:
             task_groups[group_id]['status'] = f"❌ 异常: {str(e)}"
             task_groups[group_id]['log'].append(f"❌ 异常: {str(e)}")
+    finally:
+        clear_task_group_cancel_flag(group_id)
 
 
 def process_flexible_combinations_async(
     group_id: str,
-    combinations: List[List[str]],  # [[image_path1, image_path2], [image_path3], ...]
-    prompts: List[str],
+    initial_combinations: List[List[str]],
+    stage_plan: List[dict],
     all_api_keys: List[str],
     max_workers: int,
     model: str,
@@ -571,168 +668,306 @@ def process_flexible_combinations_async(
     max_retries: int,
     output_dir: str
 ):
-    """处理灵活组合模式的任务"""
-    
-    total_combinations = len(combinations)
-    all_images = []
-    for combo in combinations:
-        all_images.extend(combo)
-    all_images = list(set(all_images))  # 去重
-    
-    # 初始化任务组状态
+    """根据阶段计划依次执行图像生成任务"""
+
+    total_stages = len(stage_plan)
+    if total_stages == 0:
+        with task_groups_lock:
+            task_groups[group_id] = {
+                'upload_progress': "0/0",
+                'api_progress': "0/0",
+                'status': "❌ 未找到有效阶段",
+                'log': ["❌ 未找到有效的提示词阶段"]
+            }
+        return
+
+    current_states = [
+        {
+            'images': combo,
+            'prompt_text': "",
+            'prompt_history': []
+        }
+        for combo in initial_combinations
+    ]
+
+    log_messages = [
+        f"🚀 任务组 {group_id[:8]}: {len(current_states)} 初始组合 | {total_stages} 个阶段"
+    ]
+
     with task_groups_lock:
         task_groups[group_id] = {
-            'upload_progress': f"0/{len(all_images)}",
+            'upload_progress': "0/0",
             'api_progress': "0/0",
-            'status': "📤 正在上传图像...",
-            'log': []
+            'status': "等待阶段开始...",
+            'log': log_messages.copy()
         }
-    
+
     try:
-        log_messages = []
-        log_messages.append(f"🚀 任务组 {group_id[:8]}: {total_combinations} 个组合 × {len(prompts)} 提示词")
-        
-        # ========== 阶段1: 上传所有图像 ==========
-        upload_results = {}  # {image_path: (cdn_url, upload_time)}
-        upload_completed = 0
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            upload_futures = {}
-            
-            for idx, image_path in enumerate(all_images, 1):
-                assigned_key = get_api_key_for_task(idx, all_api_keys)
-                future = executor.submit(upload_single_image, idx, image_path, assigned_key)
-                upload_futures[future] = image_path
-            
-            for future in as_completed(upload_futures):
-                image_path = upload_futures[future]
-                task_id, success, message, cdn_url, duration = future.result()
-                upload_completed += 1
-                
-                if success:
-                    upload_results[image_path] = (cdn_url, duration)
-                    cache_mark = "💾" if message == "使用缓存" else "✅"
-                    log_messages.append(f"{cache_mark} {message} {os.path.basename(image_path)} ({duration:.1f}s)")
-                else:
-                    log_messages.append(f"❌ 上传失败 {os.path.basename(image_path)}")
-                
+        for stage in stage_plan:
+            stage_idx = stage['stage_index']
+            suffixes = stage['suffixes']
+            stage_description = stage.get('description', f"阶段{stage_idx}")
+            replace_prompt = stage.get('replace_prompt', False)
+
+            if is_task_group_cancelled(group_id):
+                log_messages.append(f"⛔ 阶段{stage_idx}: 用户已中止任务")
                 with task_groups_lock:
-                    task_groups[group_id]['upload_progress'] = f"{upload_completed}/{len(all_images)}"
+                    task_groups[group_id]['status'] = "⛔ 用户已中止"
                     task_groups[group_id]['log'] = log_messages.copy()
-        
-        if not upload_results:
+                return
+
+            if not current_states:
+                log_messages.append(f"❌ 阶段{stage_idx}: 无可用输入，生成提前结束")
+                with task_groups_lock:
+                    task_groups[group_id]['status'] = f"❌ 阶段{stage_idx}: 无可用输入"
+                    task_groups[group_id]['log'] = log_messages.copy()
+                return
+
+            stage_input_count = len(current_states)
+            stage_prompt_count = len(suffixes)
+            stage_task_estimate = stage_input_count * stage_prompt_count
+            log_messages.append(
+                f"🚀 阶段{stage_idx}: {stage_description} | 输入 {stage_input_count} × 提示 {stage_prompt_count} ≈ {stage_task_estimate}"
+            )
+
+            # 计算阶段提示
+            stage_prompts_per_combo = []
+            stage_histories_per_combo = []
+            for state in current_states:
+                base_prompt = state['prompt_text']
+                base_history = state['prompt_history']
+                prompts_for_combo = []
+                histories_for_combo = []
+                for suffix in suffixes:
+                    if replace_prompt:
+                        final_prompt = suffix
+                        if not final_prompt or not final_prompt.strip():
+                            continue
+                        prompts_for_combo.append(final_prompt)
+                        histories_for_combo.append(base_history + [suffix] if suffix else base_history[:])
+                        continue
+                    final_prompt = base_prompt
+                    if base_prompt and suffix:
+                        final_prompt = f"{base_prompt}, {suffix}"
+                    elif not base_prompt:
+                        final_prompt = suffix
+                    # 如果最终提示为空，则跳过
+                    if not final_prompt.strip():
+                        continue
+                    prompts_for_combo.append(final_prompt)
+                    if suffix:
+                        histories_for_combo.append(base_history + [suffix])
+                    else:
+                        histories_for_combo.append(base_history[:])
+                stage_prompts_per_combo.append(prompts_for_combo)
+                stage_histories_per_combo.append(histories_for_combo)
+
+            # 收集需要上传的图像
+            unique_images = []
+            for state in current_states:
+                for img in state['images']:
+                    if img not in unique_images:
+                        unique_images.append(img)
+
             with task_groups_lock:
-                task_groups[group_id]['status'] = "❌ 所有图像上传失败"
-            return
-        
-        log_messages.append(f"✅ 上传完成: {len(upload_results)}/{len(all_images)}")
-        
-        # ========== 阶段2: 调用API（每个组合） ==========
-        with task_groups_lock:
-            task_groups[group_id]['status'] = "🍌 正在调用Banana API..."
-        
-        api_tasks = []
-        task_id = 0
-        
-        for combo_idx, combo_images in enumerate(combinations, 1):
-            # 获取该组合的所有URL
-            combo_urls = []
-            combo_upload_times = []
-            all_uploaded = True
-            
-            for img_path in combo_images:
-                if img_path in upload_results:
-                    cdn_url, upload_time = upload_results[img_path]
-                    combo_urls.append(cdn_url)
-                    combo_upload_times.append(upload_time)
-                else:
-                    all_uploaded = False
-                    break
-            
-            if not all_uploaded or not combo_urls:
-                continue
-            
-            avg_upload_time = sum(combo_upload_times) / len(combo_upload_times)
-            
-            # 为每个提示词创建任务
-            for prompt_idx, prompt in enumerate(prompts, 1):
-                task_id += 1
-                task_name = f"Task_{group_id[:8]}_{task_id}_combo{combo_idx}_p{prompt_idx}"
-                api_tasks.append({
-                    'task_id': task_id,
-                    'cdn_urls': combo_urls,
-                    'source_images': combo_images,
-                    'prompt': prompt,
-                    'task_name': task_name,
-                    'upload_time': avg_upload_time
-                })
-        
-        total_api_tasks = len(api_tasks)
-        api_results = []
-        api_completed = 0
-        
-        with task_groups_lock:
-            task_groups[group_id]['api_progress'] = f"0/{total_api_tasks}"
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            api_futures = {}
-            
-            for task in api_tasks:
-                assigned_key = get_api_key_for_task(task['task_id'], all_api_keys)
-                future = executor.submit(
-                    call_banana_api_multi,
-                    task['task_id'],
-                    task['cdn_urls'],
-                    task['prompt'],
-                    assigned_key,
-                    model,
-                    aspect_ratio,
-                    output_dir,
-                    task['task_name'],
-                    task['upload_time'],
-                    task['source_images'],
-                    max_retries
-                )
-                api_futures[future] = task
-            
-            for future in as_completed(api_futures):
-                task = api_futures[future]
-                task_id, success, message, output_file, duration, metadata = future.result()
-                api_completed += 1
-                
-                api_results.append({
-                    'task_id': task_id,
-                    'success': success,
-                    'output_file': output_file
-                })
-                
-                if success and output_file:
-                    with all_output_files_lock:
-                        all_output_files.append((output_file, metadata))
-                    log_messages.append(f"✅ Task_{task_id}: {message} ({duration:.1f}s)")
-                else:
-                    log_messages.append(f"❌ Task_{task_id}: {message}")
-                
+                task_groups[group_id]['status'] = f"📤 阶段{stage_idx}/{total_stages}: 正在上传图像..."
+                task_groups[group_id]['upload_progress'] = f"阶段{stage_idx}: 0/{len(unique_images)}"
+                task_groups[group_id]['log'] = log_messages.copy()
+
+            upload_results = {}
+            if unique_images:
+                if is_task_group_cancelled(group_id):
+                    log_messages.append(f"⛔ 阶段{stage_idx}: 用户已中止任务（跳过上传）")
+                    with task_groups_lock:
+                        task_groups[group_id]['status'] = "⛔ 用户已中止"
+                        task_groups[group_id]['log'] = log_messages.copy()
+                    return
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    upload_futures = {}
+                    for idx, image_path in enumerate(unique_images, 1):
+                        assigned_key = get_api_key_for_task(idx, all_api_keys)
+                        future = executor.submit(upload_single_image, idx, image_path, assigned_key)
+                        upload_futures[future] = image_path
+
+                    uploaded = 0
+                    for future in as_completed(upload_futures):
+                        image_path = upload_futures[future]
+                        task_id, success, message, cdn_url, duration = future.result()
+                        uploaded += 1
+                        if success and cdn_url:
+                            upload_results[image_path] = (cdn_url, duration)
+                        mark = "✅" if success else "❌"
+                        log_messages.append(f"{mark} 阶段{stage_idx} 上传 {os.path.basename(image_path)} ({duration:.1f}s) - {message}")
+                        with task_groups_lock:
+                            task_groups[group_id]['upload_progress'] = f"阶段{stage_idx}: {uploaded}/{len(unique_images)}"
+                            task_groups[group_id]['log'] = log_messages.copy()
+
+                        if is_task_group_cancelled(group_id):
+                            log_messages.append(f"⛔ 阶段{stage_idx}: 上传阶段已中止")
+                            with task_groups_lock:
+                                task_groups[group_id]['status'] = "⛔ 用户已中止"
+                                task_groups[group_id]['log'] = log_messages.copy()
+                            return
+
+            if unique_images and not upload_results:
                 with task_groups_lock:
-                    task_groups[group_id]['api_progress'] = f"{api_completed}/{total_api_tasks}"
+                    task_groups[group_id]['status'] = f"❌ 阶段{stage_idx}: 上传失败"
                     task_groups[group_id]['log'] = log_messages.copy()
-        
-        success_count = sum(1 for r in api_results if r['success'])
-        
+                return
+
+            log_messages.append(f"✅ 阶段{stage_idx}: 上传完成 {len(upload_results)}/{len(unique_images)}")
+
+            # 构建 API 任务
+            api_tasks = []
+            sequence = 0
+            for combo_idx, (state, prompts_for_combo, histories_for_combo) in enumerate(zip(current_states, stage_prompts_per_combo, stage_histories_per_combo), 1):
+                if not prompts_for_combo:
+                    continue
+                combo_images = state['images']
+                combo_urls = []
+                combo_upload_times = []
+                missing_upload = False
+                for img_path in combo_images:
+                    if img_path in upload_results:
+                        cdn_url, upload_time = upload_results[img_path]
+                        combo_urls.append(cdn_url)
+                        combo_upload_times.append(upload_time)
+                    else:
+                        missing_upload = True
+                        break
+                if missing_upload or not combo_urls:
+                    continue
+                avg_upload_time = sum(combo_upload_times) / len(combo_upload_times)
+                for prompt_idx, prompt in enumerate(prompts_for_combo, 1):
+                    history = histories_for_combo[prompt_idx - 1] if prompt_idx - 1 < len(histories_for_combo) else histories_for_combo[-1]
+                    sequence += 1
+                    task_name = f"Task_{group_id[:8]}_S{stage_idx}_C{combo_idx}_P{prompt_idx}"
+                    api_tasks.append({
+                        'sequence': sequence,
+                        'task_id': sequence,
+                        'cdn_urls': combo_urls,
+                        'source_images': combo_images,
+                        'prompt': prompt,
+                        'task_name': task_name,
+                        'upload_time': avg_upload_time,
+                        'history': history
+                    })
+
+            total_api_tasks = len(api_tasks)
+            if total_api_tasks == 0:
+                log_messages.append(f"⚠️ 阶段{stage_idx}: 未生成任何任务，提前结束")
+                with task_groups_lock:
+                    task_groups[group_id]['status'] = f"⚠️ 阶段{stage_idx}: 无任务"
+                    task_groups[group_id]['log'] = log_messages.copy()
+                return
+
+            if is_task_group_cancelled(group_id):
+                log_messages.append(f"⛔ 阶段{stage_idx}: 用户已中止任务（跳过API调用）")
+                with task_groups_lock:
+                    task_groups[group_id]['status'] = "⛔ 用户已中止"
+                    task_groups[group_id]['log'] = log_messages.copy()
+                return
+
+            with task_groups_lock:
+                task_groups[group_id]['status'] = f"🍌 阶段{stage_idx}/{total_stages}: 正在调用Banana API..."
+                task_groups[group_id]['api_progress'] = f"阶段{stage_idx}: 0/{total_api_tasks}"
+                task_groups[group_id]['log'] = log_messages.copy()
+
+            stage_success_outputs = {}
+            api_completed = 0
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                api_futures = {}
+                for task in api_tasks:
+                    assigned_key = get_api_key_for_task(task['task_id'], all_api_keys)
+                    future = executor.submit(
+                        call_banana_api_multi,
+                        task['task_id'],
+                        task['cdn_urls'],
+                        task['prompt'],
+                        assigned_key,
+                        model,
+                        aspect_ratio,
+                        output_dir,
+                        task['task_name'],
+                        task['upload_time'],
+                        task['source_images'],
+                        max_retries,
+                        {
+                            'prompt_history': task['history'],
+                            'stage_index': stage_idx,
+                            'replace_prompt': replace_prompt
+                        }
+                    )
+                    api_futures[future] = task
+
+                for future in as_completed(api_futures):
+                    task = api_futures[future]
+                    result_task_id, success, message, output_file, duration, metadata = future.result()
+                    api_completed += 1
+
+                    if success and output_file:
+                        stage_success_outputs[task['sequence']] = {
+                            'images': [output_file],
+                            'prompt_text': task['prompt'],
+                            'prompt_history': task['history']
+                        }
+                        with all_output_files_lock:
+                            all_output_files.append((output_file, metadata))
+                        log_messages.append(f"✅ 阶段{stage_idx} 任务{result_task_id}: {message} ({duration:.1f}s)")
+                    else:
+                        log_messages.append(f"❌ 阶段{stage_idx} 任务{result_task_id}: {message}")
+
+                    with task_groups_lock:
+                        task_groups[group_id]['api_progress'] = f"阶段{stage_idx}: {api_completed}/{total_api_tasks}"
+                        task_groups[group_id]['log'] = log_messages.copy()
+
+                    if is_task_group_cancelled(group_id):
+                        log_messages.append(f"⛔ 阶段{stage_idx}: API调用阶段已中止")
+                        with task_groups_lock:
+                            task_groups[group_id]['status'] = "⛔ 用户已中止"
+                            task_groups[group_id]['log'] = log_messages.copy()
+                        return
+
+            success_count = len(stage_success_outputs)
+            log_messages.append(f"✅ 阶段{stage_idx}: 成功 {success_count}/{total_api_tasks}")
+
+            if success_count == 0:
+                with task_groups_lock:
+                    task_groups[group_id]['status'] = f"❌ 阶段{stage_idx}: 全部任务失败"
+                    task_groups[group_id]['log'] = log_messages.copy()
+                return
+
+            # 更新为下一阶段的输入
+            new_states = [stage_success_outputs[idx] for idx in sorted(stage_success_outputs.keys())]
+            current_states = new_states
+
+            with task_groups_lock:
+                task_groups[group_id]['status'] = f"✅ 阶段{stage_idx}/{total_stages}: 完成"
+                task_groups[group_id]['log'] = log_messages.copy()
+
         with task_groups_lock:
-            task_groups[group_id]['status'] = f"✅ 完成: {success_count}/{total_api_tasks} 成功"
-            task_groups[group_id]['log'] = log_messages
-        
+            task_groups[group_id]['status'] = "✅ 全部阶段完成"
+            task_groups[group_id]['upload_progress'] = "完成"
+            task_groups[group_id]['api_progress'] = "完成"
+            task_groups[group_id]['log'] = log_messages.copy()
+
     except Exception as e:
+        error_msg = f"❌ 异常: {str(e)}"
+        log_messages.append(error_msg)
         with task_groups_lock:
-            task_groups[group_id]['status'] = f"❌ 异常: {str(e)}"
-            task_groups[group_id]['log'].append(f"❌ 异常: {str(e)}")
+            task_groups[group_id]['status'] = error_msg
+            existing_log = task_groups[group_id].get('log', [])
+            existing_log.append(error_msg)
+            task_groups[group_id]['log'] = existing_log
+    finally:
+        clear_task_group_cancel_flag(group_id)
 
 
 def call_banana_api_multi(task_id: int, cdn_urls: List[str], prompt: str, api_key: str, 
                          model: str, aspect_ratio: str, output_dir: str, 
                          task_name: str, upload_time: float, source_images: List[str],
-                         max_retries: int = 3) -> Tuple[int, bool, str, Optional[str], float, dict]:
+                         max_retries: int = 3, extra_metadata: Optional[dict] = None) -> Tuple[int, bool, str, Optional[str], float, dict]:
     """调用 Banana API 生成图像（多图输入版本）"""
     start_time = time.time()
     last_error = None
@@ -785,6 +1020,11 @@ def call_banana_api_multi(task_id: int, cdn_urls: List[str], prompt: str, api_ke
                 'retry_attempts': attempt,
                 'mode': 'multi-group'
             }
+
+            if extra_metadata:
+                metadata.update(extra_metadata)
+                if 'stage_index' in extra_metadata and metadata.get('mode') == 'multi-group':
+                    metadata['mode'] = 'flexible-stage'
             
             with image_metadata_lock:
                 image_metadata[output_path] = metadata
@@ -851,6 +1091,8 @@ def batch_generate(
     # 生成任务组ID
     group_id = str(uuid.uuid4())
     
+    register_task_group_for_cancel(group_id)
+
     # 在后台线程中启动任务处理
     thread = threading.Thread(
         target=process_task_group_async,
@@ -921,6 +1163,122 @@ def calculate_image_combinations(pages_data):
     return all_combinations
 
 
+def parse_prompt_groups(raw_groups):
+    """根据原始输入解析提示词组配置"""
+    parsed_groups = []
+    for idx, (text, mode, inherit, label) in enumerate(raw_groups, start=1):
+        lines = []
+        if text:
+            lines = [line.strip() for line in text.strip().split('\n') if line.strip()]
+        if not lines:
+            if inherit:
+                raise ValueError(f"{label} 启用了继承模式，但没有有效的提示词")
+            # 空组且未启用继承，跳过
+            continue
+        parsed_groups.append({
+            'index': idx,
+            'label': label,
+            'prompts': lines,
+            'mode': mode,
+            'inherit': inherit
+        })
+    if not parsed_groups:
+        raise ValueError("请至少输入一个提示词")
+    if parsed_groups[0]['inherit']:
+        raise ValueError("第一个提示词组不能启用继承模式")
+    return parsed_groups
+
+
+def generate_prompt_suffixes_from_groups(groups):
+    """计算某阶段的所有提示词组合字符串"""
+    from itertools import product
+
+    combo_sources = []
+    for group in groups:
+        prompts = group['prompts']
+        if not prompts:
+            continue
+        if group['mode'] == "相乘":
+            combo_sources.append([[p] for p in prompts])
+        else:
+            combo_sources.append([prompts])
+    if not combo_sources:
+        return []
+
+    suffixes = []
+    for combo in product(*combo_sources):
+        merged = []
+        for prompt_list in combo:
+            merged.extend(prompt_list)
+        suffixes.append(", ".join(merged))
+    return suffixes
+
+
+def describe_stage(groups):
+    """生成阶段描述文本"""
+    parts = []
+    for group in groups:
+        mode_symbol = "×" if group['mode'] == "相乘" else "+"
+        inherit_suffix = "→继承" if group['inherit'] else ""
+        parts.append(f"{group['label']}({mode_symbol}){inherit_suffix}")
+    return " + ".join(parts)
+
+
+def build_pipeline_plan(prompt_groups):
+    """根据提示词组构建阶段计划"""
+    stage_groups = []
+    current = []
+    for group in prompt_groups:
+        if group['inherit']:
+            if current:
+                stage_groups.append(current.copy())
+                current.clear()
+            stage_groups.append([group])
+        else:
+            current.append(group)
+    if current:
+        stage_groups.append(current)
+
+    stage_plan = []
+    stage_index = 0
+    for groups in stage_groups:
+        suffixes = generate_prompt_suffixes_from_groups(groups)
+        if not suffixes:
+            continue
+        stage_index += 1
+        inherit_stage = any(g['inherit'] for g in groups)
+        stage_plan.append({
+            'stage_index': stage_index,
+            'groups': groups,
+            'suffixes': suffixes,
+            'prompt_count': len(suffixes),
+            'description': describe_stage(groups),
+            'inherit_stage': inherit_stage,
+            'replace_prompt': inherit_stage and all(g['mode'] == "相乘" for g in groups)
+        })
+    if not stage_plan:
+        raise ValueError("未能生成有效的提示词组合，请检查输入")
+    return stage_plan
+
+
+def compute_pipeline_statistics(initial_combo_count, stage_plan):
+    """计算阶段统计信息并更新阶段配置"""
+    stage_summaries = []
+    current_inputs = initial_combo_count
+    total_tasks = 0
+    for stage in stage_plan:
+        prompt_count = stage['prompt_count']
+        stage_tasks = current_inputs * prompt_count
+        stage['input_count'] = current_inputs
+        stage['task_count'] = stage_tasks
+        stage_summaries.append(
+            f"阶段{stage['stage_index']}: {current_inputs} 输入 × {prompt_count} 提示 = {stage_tasks} 任务"
+        )
+        total_tasks += stage_tasks
+        current_inputs = stage_tasks if stage_tasks > 0 else current_inputs
+    return total_tasks, stage_summaries, current_inputs
+
+
 def batch_generate_flexible(
     # 每页的图像和模式
     page1_images, page1_mode,
@@ -928,8 +1286,11 @@ def batch_generate_flexible(
     page3_images, page3_mode,
     page4_images, page4_mode,
     page5_images, page5_mode,
+    # 提示词分组
+    prompt1_text: str, prompt1_mode: str, prompt1_inherit: bool,
+    prompt2_text: str, prompt2_mode: str, prompt2_inherit: bool,
+    prompt3_text: str, prompt3_mode: str, prompt3_inherit: bool,
     # 公共参数
-    prompts_text: str,
     main_api_key: str,
     backup_api_keys: str,
     use_multiple_accounts: bool,
@@ -937,36 +1298,33 @@ def batch_generate_flexible(
     model: str,
     aspect_ratio: str,
     max_retries: int,
-    output_dir: str,
-    # 确认状态
-    confirmed: bool
+    output_dir: str
 ):
-    """灵活组合模式的生成函数"""
-    
-    # 验证提示词
-    if not prompts_text.strip():
-        return "❌ 请输入提示词", None, "", False
-    
+    """灵活组合模式的生成函数（支持提示词继承）"""
+
     if not main_api_key.strip():
-        return "❌ 请输入主API密钥", None, "", False
-    
-    # 验证并创建输出目录
+        return "❌ 请输入主API密钥", None, ""
+
     if not output_dir or not output_dir.strip():
         output_dir = OUTPUT_DIR
     else:
         output_dir = output_dir.strip()
-    
+
     try:
         os.makedirs(output_dir, exist_ok=True)
     except Exception as e:
-        return f"❌ 无法创建输出目录: {str(e)}", None, "", False
-    
-    # 解析提示词
-    prompts = [line.strip() for line in prompts_text.strip().split('\n') if line.strip()]
-    if not prompts:
-        return "❌ 请输入有效的提示词", None, "", False
-    
-    # 收集所有页面数据
+        return f"❌ 无法创建输出目录: {str(e)}", None, ""
+
+    raw_prompt_groups = [
+        (prompt1_text, prompt1_mode, prompt1_inherit, "提示词组1"),
+        (prompt2_text, prompt2_mode, prompt2_inherit, "提示词组2"),
+        (prompt3_text, prompt3_mode, prompt3_inherit, "提示词组3"),
+    ]
+    try:
+        prompt_groups = parse_prompt_groups(raw_prompt_groups)
+    except ValueError as e:
+        return f"❌ {str(e)}", None, ""
+
     pages_data = [
         (page1_images if page1_images else [], page1_mode),
         (page2_images if page2_images else [], page2_mode),
@@ -974,45 +1332,39 @@ def batch_generate_flexible(
         (page4_images if page4_images else [], page4_mode),
         (page5_images if page5_images else [], page5_mode),
     ]
-    
-    # 计算所有图像组合
+
     combinations = calculate_image_combinations(pages_data)
-    
     if not combinations:
-        return "❌ 请至少上传一张图像", None, "", False
-    
-    # 计算任务数
-    total_combinations = len(combinations)
-    total_tasks = total_combinations * len(prompts)
-    
-    # 检查是否需要二次确认（2个以上相乘页面）
-    multiply_count = sum(1 for imgs, mode in pages_data if imgs and mode == "相乘")
-    
-    if multiply_count >= 2 and not confirmed:
-        # 需要二次确认
-        return (
-            f"⚠️ 检测到{multiply_count}个相乘页面\n📊 将生成 {total_combinations} 个组合 × {len(prompts)} 个提示词 = {total_tasks} 个任务\n\n请再次点击【开始生成】确认执行",
-            None,
-            "等待确认...",
-            True  # 设置确认状态为 True
-        )
-    
-    # 准备API密钥列表
+        return "❌ 请至少上传一张图像", None, ""
+
+    try:
+        stage_plan = build_pipeline_plan(prompt_groups)
+    except ValueError as e:
+        return f"❌ {str(e)}", None, ""
+
+    initial_combo_count = len(combinations)
+    total_tasks, stage_summaries, _ = compute_pipeline_statistics(initial_combo_count, stage_plan)
+    if total_tasks == 0:
+        return "❌ 无法计算任务数，请检查提示词输入", None, ""
+
+    # 移除二次确认逻辑，直接开始任务
+    # 任务数量较多时会在预估框显示警告，用户可自行查看
+
     all_api_keys = [main_api_key.strip()]
     if use_multiple_accounts and backup_api_keys.strip():
         backup_keys = [k.strip() for k in backup_api_keys.strip().split('\n') if k.strip()]
         all_api_keys.extend(backup_keys)
-    
-    # 生成任务组ID
+
     group_id = str(uuid.uuid4())
-    
-    # 启动后台任务（传递组合列表）
+
+    register_task_group_for_cancel(group_id)
+
     thread = threading.Thread(
         target=process_flexible_combinations_async,
         args=(
             group_id,
             combinations,
-            prompts,
+            stage_plan,
             all_api_keys,
             max_workers,
             model,
@@ -1023,12 +1375,17 @@ def batch_generate_flexible(
         daemon=True
     )
     thread.start()
-    
+
+    stage_breakdown = "\n".join(stage_summaries)
+    success_msg = (
+        f"✅ 已提交任务组 {group_id[:8]}\n"
+        f"📊 阶段任务:\n{stage_breakdown}\n合计 {total_tasks} 个任务\n"
+        f"⚡ 并发数: {max_workers} | 🔑 {len(all_api_keys)} 个账号"
+    )
     return (
-        f"✅ 已提交任务组 {group_id[:8]}\n📊 {total_combinations} 个组合 × {len(prompts)} 个提示词 = {total_tasks} 个任务\n⚡ 并发数: {max_workers} | 🔑 {len(all_api_keys)} 个账号",
+        success_msg,
         gr.update(),
-        f"任务组 {group_id[:8]} 已提交，正在后台执行...",
-        False  # 重置确认状态
+        f"任务组 {group_id[:8]} 已提交，正在后台执行..."
     )
 
 
@@ -1086,6 +1443,7 @@ def batch_generate_unified(
     
     # 生成任务组ID
     group_id = str(uuid.uuid4())
+    register_task_group_for_cancel(group_id)
     
     if mode == "单图模式":
         # 单图模式
@@ -1213,73 +1571,66 @@ def get_current_status():
 
 # 创建 Gradio 界面
 with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
-    # 标题栏（带输出目录设置）
+    # 标题栏
+    gr.Markdown("# 🍌 Banana 图像生成 WebUI")
+    
+    # 配置和输出目录放在同一行
     with gr.Row():
-        with gr.Column(scale=3):
-            gr.Markdown("# 🍌 Banana 图像生成 WebUI")
-        with gr.Column(scale=1):
-            output_dir_input = gr.Textbox(
-                label="📁 输出目录",
-                value=os.path.join(os.path.dirname(__file__), "outputs"),
-                placeholder="输入保存目录路径",
-                scale=1
+        with gr.Accordion("⚙️ 配置（API、模型、并发参数）", open=False):
+            with gr.Row():
+                main_key_input = gr.Textbox(
+                    label="主API密钥",
+                    value=DEFAULT_API_KEY,
+                    type="password",
+                    scale=2
+                )
+                
+                use_multi_acc = gr.Checkbox(
+                    label="启用多账户",
+                    value=False,
+                    scale=1
+                )
+            
+            backup_keys_input = gr.Textbox(
+                label="备用API密钥（每行一个）",
+                value=DEFAULT_BACKUP_KEYS,
+                lines=2,
+                visible=False
             )
+            
+            with gr.Row():
+                workers_input = gr.Slider(
+                    label="并发数",
+                    minimum=1,
+                    maximum=20,
+                    value=10,
+                    step=1
+                )
+                
+                retries_input = gr.Slider(
+                    label="最大重试次数",
+                    minimum=1,
+                    maximum=5,
+                    value=3,
+                    step=1
+                )
+            
+            with gr.Row():
+                model_input = gr.Dropdown(
+                    label="模型",
+                    choices=["nano-banana-fast", "nano-banana"],
+                    value="nano-banana-fast"
+                )
+        
+        output_dir_input = gr.Textbox(
+            label="📁 输出目录",
+            value=os.path.join(os.path.dirname(__file__), "outputs"),
+            placeholder="输入保存目录路径",
+            scale=1
+        )
     
     # 自动刷新定时器（每2秒）
     auto_refresh = gr.Timer(value=2)
-    
-    # 低频配置区（折叠）
-    with gr.Accordion("⚙️ 配置（API、模型、并发参数）", open=False):
-        with gr.Row():
-            main_key_input = gr.Textbox(
-                label="主API密钥",
-                value=DEFAULT_API_KEY,
-                type="password",
-                scale=2
-            )
-            
-            use_multi_acc = gr.Checkbox(
-                label="启用多账户",
-                value=False,
-                scale=1
-            )
-        
-        backup_keys_input = gr.Textbox(
-            label="备用API密钥（每行一个）",
-            value=DEFAULT_BACKUP_KEYS,
-            lines=2,
-            visible=False
-        )
-        
-        with gr.Row():
-            workers_input = gr.Slider(
-                label="并发数",
-                minimum=1,
-                maximum=20,
-                value=10,
-                step=1
-            )
-            
-            retries_input = gr.Slider(
-                label="最大重试次数",
-                minimum=1,
-                maximum=5,
-                value=3,
-                step=1
-            )
-        
-        with gr.Row():
-            model_input = gr.Dropdown(
-                label="模型",
-                choices=["nano-banana-fast", "nano-banana"],
-                value="nano-banana-fast"
-            )
-            
-            aspect_ratio_input = gr.Dropdown(
-                label="宽高比",
-                choices=["auto", "1:1", "16:9", "9:16", "4:3", "3:4"],
-                value="auto"
-            )
     
     # 多账户切换显示备用密钥输入框
     def toggle_backup_keys(use_multi):
@@ -1293,168 +1644,220 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
     
     with gr.Row():
         with gr.Column(scale=1):
-            gr.Markdown("### 📤 图像上传与组合")
-            
             # 多页面图像上传区域
             with gr.Tabs() as image_tabs:
-                # 页面1（默认相乘）
-                with gr.Tab("📄 页面1", id=1) as tab1:
+                # 图像1（默认相乘）
+                with gr.Tab("📄 图像1", id=1) as tab1:
                     with gr.Row():
-                        page1_mode = gr.Radio(
-                            choices=["相乘", "相加"],
-                            value="相乘",
-                            label="🔧 组合方式",
-                            info="相乘：每张图单独 | 相加：合并为一组"
-                        )
-                    page1_upload = gr.File(
-                        label="上传图像到页面1",
-                        file_count="multiple",
-                        file_types=["image"],
-                        type="filepath",
-                        height=100
-                    )
+                        with gr.Column(scale=1, min_width=150):
+                            page1_mode = gr.Radio(
+                                choices=["相乘", "相加"],
+                                value="相乘",
+                                label="🔧 组合方式"
+                            )
+                        with gr.Column(scale=3):
+                            page1_upload = gr.File(
+                                label="上传图像",
+                                file_count="multiple",
+                                file_types=["image"],
+                                type="filepath",
+                                height=150
+                            )
                     page1_gallery = gr.Gallery(
-                        label="页面1 - 已上传图像",
+                        label="图像1 - 已上传图像",
                         columns=4,
-                        rows=2,
-                        height=300,
+                        rows=3,
+                        height=600,
                         object_fit="scale-down"
                     )
                     with gr.Row():
                         page1_delete_btn = gr.Button("❌ 删除所选", size="sm")
                         page1_clear_btn = gr.Button("🗑️ 清空", size="sm")
                 
-                # 页面2（默认相加）
-                with gr.Tab("📄 页面2", id=2) as tab2:
+                # 图像2（默认相加）
+                with gr.Tab("📄 图像2", id=2) as tab2:
                     with gr.Row():
-                        page2_mode = gr.Radio(
-                            choices=["相乘", "相加"],
-                            value="相加",
-                            label="🔧 组合方式",
-                            info="相乘：每张图单独 | 相加：合并为一组"
-                        )
-                    page2_upload = gr.File(
-                        label="上传图像到页面2",
-                        file_count="multiple",
-                        file_types=["image"],
-                        type="filepath",
-                        height=100
-                    )
+                        with gr.Column(scale=1, min_width=150):
+                            page2_mode = gr.Radio(
+                                choices=["相乘", "相加"],
+                                value="相乘",
+                                label="🔧 组合方式"
+                            )
+                        with gr.Column(scale=3):
+                            page2_upload = gr.File(
+                                label="上传图像",
+                                file_count="multiple",
+                                file_types=["image"],
+                                type="filepath",
+                                height=150
+                            )
                     page2_gallery = gr.Gallery(
-                        label="页面2 - 已上传图像",
+                        label="图像2 - 已上传图像",
                         columns=4,
-                        rows=2,
-                        height=300,
+                        rows=3,
+                        height=600,
                         object_fit="scale-down"
                     )
                     with gr.Row():
                         page2_delete_btn = gr.Button("❌ 删除所选", size="sm")
                         page2_clear_btn = gr.Button("🗑️ 清空", size="sm")
                 
-                # 页面3（默认相加）
-                with gr.Tab("📄 页面3", id=3) as tab3:
+                # 图像3（默认相加）
+                with gr.Tab("📄 图像3", id=3) as tab3:
                     with gr.Row():
-                        page3_mode = gr.Radio(
-                            choices=["相乘", "相加"],
-                            value="相加",
-                            label="🔧 组合方式",
-                            info="相乘：每张图单独 | 相加：合并为一组"
-                        )
-                    page3_upload = gr.File(
-                        label="上传图像到页面3",
-                        file_count="multiple",
-                        file_types=["image"],
-                        type="filepath",
-                        height=100
-                    )
+                        with gr.Column(scale=1, min_width=150):
+                            page3_mode = gr.Radio(
+                                choices=["相乘", "相加"],
+                                value="相乘",
+                                label="🔧 组合方式"
+                            )
+                        with gr.Column(scale=3):
+                            page3_upload = gr.File(
+                                label="上传图像",
+                                file_count="multiple",
+                                file_types=["image"],
+                                type="filepath",
+                                height=150 
+                            )
                     page3_gallery = gr.Gallery(
-                        label="页面3 - 已上传图像",
+                        label="图像3 - 已上传图像",
                         columns=4,
-                        rows=2,
-                        height=300,
+                        rows=3,
+                        height=600,
                         object_fit="scale-down"
                     )
                     with gr.Row():
                         page3_delete_btn = gr.Button("❌ 删除所选", size="sm")
                         page3_clear_btn = gr.Button("🗑️ 清空", size="sm")
                 
-                # 页面4（默认相加）
-                with gr.Tab("📄 页面4", id=4) as tab4:
+                # 图像4（默认相加）
+                with gr.Tab("📄 图像4", id=4) as tab4:
                     with gr.Row():
-                        page4_mode = gr.Radio(
-                            choices=["相乘", "相加"],
-                            value="相加",
-                            label="🔧 组合方式",
-                            info="相乘：每张图单独 | 相加：合并为一组"
-                        )
-                    page4_upload = gr.File(
-                        label="上传图像到页面4",
-                        file_count="multiple",
-                        file_types=["image"],
-                        type="filepath",
-                        height=100
-                    )
+                        with gr.Column(scale=1, min_width=150):
+                            page4_mode = gr.Radio(
+                                choices=["相乘", "相加"],
+                                value="相乘",
+                                label="🔧 组合方式"
+                            )
+                        with gr.Column(scale=3):
+                            page4_upload = gr.File(
+                                label="上传图像",
+                                file_count="multiple",
+                                file_types=["image"],
+                                type="filepath",
+                                height=150
+                            )
                     page4_gallery = gr.Gallery(
-                        label="页面4 - 已上传图像",
+                        label="图像4 - 已上传图像",
                         columns=4,
-                        rows=2,
-                        height=300,
+                        rows=3,
+                        height=600,
                         object_fit="scale-down"
                     )
                     with gr.Row():
                         page4_delete_btn = gr.Button("❌ 删除所选", size="sm")
                         page4_clear_btn = gr.Button("🗑️ 清空", size="sm")
                 
-                # 页面5（默认相加）
-                with gr.Tab("📄 页面5", id=5) as tab5:
+                # 图像5（默认相加）
+                with gr.Tab("📄 图像5", id=5) as tab5:
                     with gr.Row():
-                        page5_mode = gr.Radio(
-                            choices=["相乘", "相加"],
-                            value="相加",
-                            label="🔧 组合方式",
-                            info="相乘：每张图单独 | 相加：合并为一组"
-                        )
-                    page5_upload = gr.File(
-                        label="上传图像到页面5",
-                        file_count="multiple",
-                        file_types=["image"],
-                        type="filepath",
-                        height=100
-                    )
+                        with gr.Column(scale=1, min_width=150):
+                            page5_mode = gr.Radio(
+                                choices=["相乘", "相加"],
+                                value="相乘",
+                                label="🔧 组合方式"
+                            )
+                        with gr.Column(scale=3):
+                            page5_upload = gr.File(
+                                label="上传图像",
+                                file_count="multiple",
+                                file_types=["image"],
+                                type="filepath",
+                                height=150
+                            )
                     page5_gallery = gr.Gallery(
-                        label="页面5 - 已上传图像",
+                        label="图像5 - 已上传图像",
                         columns=4,
-                        rows=2,
-                        height=300,
+                        rows=3,
+                        height=600,
                         object_fit="scale-down"
                     )
                     with gr.Row():
                         page5_delete_btn = gr.Button("❌ 删除所选", size="sm")
                         page5_clear_btn = gr.Button("🗑️ 清空", size="sm")
             
-            # 任务数预估
+            # ========== 提示词分组区域 ==========
+            with gr.Tabs() as prompt_tabs:
+                # 提示词组1（基础，默认相乘，不可继承）
+                with gr.Tab("📝 提示词组1 · 基础", id=1) as prompt_tab1:
+                    prompt1_text = gr.Textbox(
+                        label="提示词组1",
+                        placeholder="基础提示词，每行一个",
+                        lines=4
+                    )
+
+                # 提示词组2（可选）
+                with gr.Tab("📝 提示词组2", id=2) as prompt_tab2:
+                    prompt2_text = gr.Textbox(
+                        label="提示词组2",
+                        placeholder="可选：用于二阶段补充内容",
+                        lines=4
+                    )
+                    with gr.Row():
+                        prompt2_mode = gr.Radio(
+                            label="组合方式",
+                            choices=["相乘", "相加"],
+                            value="相乘",
+                            info="留空则跳过此组"
+                        )
+                        prompt2_inherit = gr.Checkbox(
+                            label="继承上一阶段",
+                            value=False,
+                            info="启用后会基于上一阶段结果继续生成"
+                        )
+
+                # 提示词组3（可选）
+                with gr.Tab("📝 提示词组3", id=3) as prompt_tab3:
+                    prompt3_text = gr.Textbox(
+                        label="提示词组3",
+                        placeholder="可选：用于三阶段精修",
+                        lines=4
+                    )
+                    with gr.Row():
+                        prompt3_mode = gr.Radio(
+                            label="组合方式",
+                            choices=["相乘", "相加"],
+                            value="相乘",
+                            info="留空则跳过此组"
+                        )
+                        prompt3_inherit = gr.Checkbox(
+                            label="继承上一阶段",
+                            value=False,
+                            info="启用后要求组合方式为相乘"
+                        )
+
+            prompt1_mode = gr.State(value="相乘")
+            prompt1_inherit = gr.State(value=False)
+
             with gr.Row():
-                task_estimate = gr.Textbox(
-                    label="📊 预估任务数",
-                    value="等待上传图像...",
-                    interactive=False,
-                    scale=1
+                aspect_ratio_input = gr.Dropdown(
+                    label="宽高比",
+                    choices=["auto", "1:1", "16:9", "9:16", "4:3", "3:4"],
+                    value="auto"
                 )
             
-            # 隐藏的确认状态（用于二次确认逻辑）
-            confirmation_state = gr.State(value=False)
-            
-            # ========== 提示词区域（独立，两种模式共享） ==========
-            prompts_input = gr.Textbox(
-                label="📝 提示词（每行一个）",
-                placeholder="换一个自然休闲优雅的pose，保持面无表情\n换成坐姿，表情微笑，眼神看向镜头",
-                lines=6
+            # 任务数预估（移到按钮上方）
+            task_estimate = gr.Textbox(
+                label="📊 预估任务数",
+                value="等待上传图像...",
+                interactive=False
             )
             
             # 操作按钮
             with gr.Row():
                 generate_btn = gr.Button("🚀 开始生成", variant="primary", size="lg")
                 refresh_btn = gr.Button("🔄 刷新状态", variant="secondary")
+                cancel_tasks_btn = gr.Button("⛔ 中止任务", variant="secondary")
             
             with gr.Row():
                 clear_cache_btn = gr.Button("🗑️ 清空上传缓存", variant="secondary", size="sm")
@@ -1472,8 +1875,8 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
             gallery_output = gr.Gallery(
                 label="生成的图像（点击查看详情）",
                 columns=4,
-                rows=2,
-                height=400,
+                rows=3,
+                height=600,
                 object_fit="contain"
             )
             
@@ -1504,11 +1907,11 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
     selected_preview_index = gr.State(None)  # 记录预览选中的索引
     
     # 多图分组模式状态
-    page1_files = gr.State([])  # 页面1的图像列表
-    page2_files = gr.State([])  # 页面2的图像列表
-    page3_files = gr.State([])  # 页面3的图像列表
-    page4_files = gr.State([])  # 页面4的图像列表
-    page5_files = gr.State([])  # 页面5的图像列表
+    page1_files = gr.State([])  # 图像1的图像列表
+    page2_files = gr.State([])  # 图像2的图像列表
+    page3_files = gr.State([])  # 图像3的图像列表
+    page4_files = gr.State([])  # 图像4的图像列表
+    page5_files = gr.State([])  # 图像5的图像列表
     page1_selected_idx = gr.State(None)
     page2_selected_idx = gr.State(None)
     page3_selected_idx = gr.State(None)
@@ -1516,11 +1919,20 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
     page5_selected_idx = gr.State(None)
     
     # 预估任务数计算函数
-    def calculate_task_estimate(
-        p1_imgs, p1_mode, p2_imgs, p2_mode, p3_imgs, p3_mode,
-        p4_imgs, p4_mode, p5_imgs, p5_mode, prompts_text
-    ):
-        """实时计算预估任务数"""
+    def calculate_task_estimate(*args):
+        """实时计算预估任务数，容忍缺失输入"""
+        expected_len = 19
+        if not args or len(args) < expected_len:
+            return "等待上传图像..."
+
+        (
+            p1_imgs, p1_mode, p2_imgs, p2_mode, p3_imgs, p3_mode,
+            p4_imgs, p4_mode, p5_imgs, p5_mode,
+            g1_text, g1_mode, g1_inherit,
+            g2_text, g2_mode, g2_inherit,
+            g3_text, g3_mode, g3_inherit
+        ) = args[:expected_len]
+
         pages_data = [
             (p1_imgs if p1_imgs else [], p1_mode),
             (p2_imgs if p2_imgs else [], p2_mode),
@@ -1530,25 +1942,44 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
         ]
         
         combinations = calculate_image_combinations(pages_data)
-        
+
         if not combinations:
             return "等待上传图像..."
-        
-        prompts = [line.strip() for line in prompts_text.strip().split('\n') if line.strip()]
-        prompt_count = len(prompts) if prompts else 1
-        
+
+        raw_prompt_groups = [
+            (g1_text, g1_mode, bool(g1_inherit), "提示词组1"),
+            (g2_text, g2_mode, bool(g2_inherit), "提示词组2"),
+            (g3_text, g3_mode, bool(g3_inherit), "提示词组3"),
+        ]
+
+        try:
+            prompt_groups = parse_prompt_groups(raw_prompt_groups)
+            stage_plan = build_pipeline_plan(prompt_groups)
+        except ValueError as err:
+            return str(err)
+        except Exception:
+            return "提示词配置无效，请检查"
+
         total_combos = len(combinations)
-        total_tasks = total_combos * prompt_count
-        
-        # 检查相乘页面数
+        total_tasks, stage_summaries, _ = compute_pipeline_statistics(total_combos, stage_plan)
+        stage_summary_text = " | ".join(stage_summaries)
+
+        # 检查相乘图像数
         multiply_count = sum(1 for imgs, mode in pages_data if imgs and mode == "相乘")
-        
+        prompt_multiply = sum(1 for group in prompt_groups if group['mode'] == "相乘")
+        inherit_count = sum(1 for group in prompt_groups if group['inherit'])
+
+        warning_parts = []
         if multiply_count >= 2:
-            warning = f"⚠️ {multiply_count}个相乘页面 | "
-        else:
-            warning = ""
-        
-        return f"{warning}{total_combos} 组合 × {prompt_count} 提示词 = {total_tasks} 任务"
+            warning_parts.append(f"{multiply_count}个相乘图像")
+        if prompt_multiply >= 2:
+            warning_parts.append(f"{prompt_multiply}个相乘提示词组")
+        if inherit_count:
+            warning_parts.append(f"{inherit_count}个继承提示词组")
+
+        warning_prefix = f"⚠️ {' · '.join(warning_parts)} | " if warning_parts else ""
+        stage_suffix = f" | {stage_summary_text}" if stage_summary_text else ""
+        return f"{warning_prefix}{total_combos} 组合，预计 {total_tasks} 任务{stage_suffix}"
     
     # 添加图像到列表（追加模式）
     def add_images(existing_files, new_files):
@@ -1604,9 +2035,9 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
         
         return new_list, new_list, new_selected_idx
     
-    # ========== 多页面图像管理函数 ==========
+    # ========== 多图像图像管理函数 ==========
     def add_images_to_page(existing_files, new_files):
-        """为某个页面添加图像"""
+        """为某个图像添加图像"""
         if existing_files is None:
             existing_files = []
         
@@ -1650,7 +2081,7 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
         return new_list, new_list, new_selected_idx
     
     # ========== 多图分组模式事件绑定 ==========
-    # 页面1
+    # 图像1
     page1_upload.upload(
         fn=add_images_to_page,
         inputs=[page1_files, page1_upload],
@@ -1674,7 +2105,7 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
         outputs=[page1_files, page1_gallery, page1_upload]
     )
     
-    # 页面2
+    # 图像2
     page2_upload.upload(
         fn=add_images_to_page,
         inputs=[page2_files, page2_upload],
@@ -1698,7 +2129,7 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
         outputs=[page2_files, page2_gallery, page2_upload]
     )
     
-    # 页面3
+    # 图像3
     page3_upload.upload(
         fn=add_images_to_page,
         inputs=[page3_files, page3_upload],
@@ -1722,7 +2153,7 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
         outputs=[page3_files, page3_gallery, page3_upload]
     )
     
-    # 页面4
+    # 图像4
     page4_upload.upload(
         fn=add_images_to_page,
         inputs=[page4_files, page4_upload],
@@ -1746,7 +2177,7 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
         outputs=[page4_files, page4_gallery, page4_upload]
     )
     
-    # 页面5
+    # 图像5
     page5_upload.upload(
         fn=add_images_to_page,
         inputs=[page5_files, page5_upload],
@@ -1782,7 +2213,10 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
             inputs=[
                 page1_files, page1_mode, page2_files, page2_mode,
                 page3_files, page3_mode, page4_files, page4_mode,
-                page5_files, page5_mode, prompts_input
+                page5_files, page5_mode,
+                prompt1_text, prompt1_mode, prompt1_inherit,
+                prompt2_text, prompt2_mode, prompt2_inherit,
+                prompt3_text, prompt3_mode, prompt3_inherit
             ],
             outputs=[task_estimate]
         )
@@ -1791,20 +2225,32 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
             inputs=[
                 page1_files, page1_mode, page2_files, page2_mode,
                 page3_files, page3_mode, page4_files, page4_mode,
-                page5_files, page5_mode, prompts_input
+                page5_files, page5_mode,
+                prompt1_text, prompt1_mode, prompt1_inherit,
+                prompt2_text, prompt2_mode, prompt2_inherit,
+                prompt3_text, prompt3_mode, prompt3_inherit
             ],
             outputs=[task_estimate]
         )
     
-    prompts_input.change(
-        fn=calculate_task_estimate,
-        inputs=[
-            page1_files, page1_mode, page2_files, page2_mode,
-            page3_files, page3_mode, page4_files, page4_mode,
-            page5_files, page5_mode, prompts_input
-        ],
-        outputs=[task_estimate]
-    )
+        for prompt_component in [
+            prompt1_text,
+            prompt2_text, prompt2_mode, prompt2_inherit,
+            prompt3_text, prompt3_mode, prompt3_inherit
+        ]:
+            if hasattr(prompt_component, "change"):
+                prompt_component.change(
+                    fn=calculate_task_estimate,
+                    inputs=[
+                        page1_files, page1_mode, page2_files, page2_mode,
+                        page3_files, page3_mode, page4_files, page4_mode,
+                        page5_files, page5_mode,
+                        prompt1_text, prompt1_mode, prompt1_inherit,
+                        prompt2_text, prompt2_mode, prompt2_inherit,
+                        prompt3_text, prompt3_mode, prompt3_inherit
+                    ],
+                    outputs=[task_estimate]
+                )
     
     # ========== 生成按钮事件 ==========
     generate_btn.click(
@@ -1816,8 +2262,11 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
             page3_files, page3_mode,
             page4_files, page4_mode,
             page5_files, page5_mode,
+            # 提示词分组
+            prompt1_text, prompt1_mode, prompt1_inherit,
+            prompt2_text, prompt2_mode, prompt2_inherit,
+            prompt3_text, prompt3_mode, prompt3_inherit,
             # 公共参数
-            prompts_input,
             main_key_input,
             backup_keys_input,
             use_multi_acc,
@@ -1825,15 +2274,12 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
             model_input,
             aspect_ratio_input,
             retries_input,
-            output_dir_input,
-            # 确认状态
-            confirmation_state
+            output_dir_input
         ],
         outputs=[
             summary_output, 
             gallery_output,
-            log_output,
-            confirmation_state  # 更新确认状态
+            log_output
         ]
     )
     
@@ -1861,6 +2307,18 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
         fn=clear_upload_cache,
         outputs=[summary_output]
     )
+
+    def cancel_all_tasks_ui():
+        cancelled = request_cancel_all_tasks()
+        if not cancelled:
+            return "ℹ️ 当前没有进行中的任务"
+        short_ids = ", ".join(gid[:8] for gid in cancelled)
+        return f"⛔ 已请求中止 {len(cancelled)} 个任务组 ({short_ids})"
+
+    cancel_tasks_btn.click(
+        fn=cancel_all_tasks_ui,
+        outputs=[summary_output]
+    )
     
     # 图库选择事件：点击图像显示详情
     def on_select_image(evt: gr.SelectData):
@@ -1871,7 +2329,7 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
                 
                 # 判断是单图还是多图模式
                 mode = metadata.get('mode', 'single')
-                
+
                 if mode == 'multi-group':
                     # 多图模式
                     source_images = metadata.get('source_images', [])
@@ -1880,6 +2338,23 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
 📸 源图像 ({len(source_images)}张):
    {', '.join(source_names)}
 📝 提示词: {metadata.get('prompt', 'N/A')}
+🤖 模型: {metadata.get('model', 'N/A')}
+📐 宽高比: {metadata.get('aspect_ratio', 'N/A')}
+⏱️ 上传耗时: {metadata.get('upload_time', 0):.1f}秒
+⏱️ API耗时: {metadata.get('api_time', 0):.1f}秒
+⏱️ 总耗时: {metadata.get('total_time', 0):.1f}秒"""
+                elif mode == 'flexible-stage':
+                    source_images = metadata.get('source_images', [])
+                    source_names = [os.path.basename(img) for img in source_images]
+                    prompt_history = metadata.get('prompt_history', [])
+                    history_text = " → ".join(prompt_history) if prompt_history else metadata.get('prompt', 'N/A')
+                    info_text = f"""🔢 模式: 灵活分阶段
+📶 阶段: {metadata.get('stage_index', '?')}
+🔁 覆盖上一阶段: {'是' if metadata.get('replace_prompt') else '否'}
+📜 提示词链: {history_text}
+📸 源图像 ({len(source_images)}张):
+   {', '.join(source_names)}
+📝 当前提示词: {metadata.get('prompt', 'N/A')}
 🤖 模型: {metadata.get('model', 'N/A')}
 📐 宽高比: {metadata.get('aspect_ratio', 'N/A')}
 ⏱️ 上传耗时: {metadata.get('upload_time', 0):.1f}秒
@@ -1950,7 +2425,13 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
         
         # 创建组合（单个组合，包含所有源图像）
         combinations = [valid_images]
-        prompts = [prompt]
+        stage_plan = [{
+            'stage_index': 1,
+            'suffixes': [prompt],
+            'prompt_count': 1,
+            'description': '重做任务',
+            'inherit_stage': False
+        }]
         
         # 启动后台任务
         thread = threading.Thread(
@@ -1958,7 +2439,7 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
             args=(
                 group_id,
                 combinations,
-                prompts,
+                stage_plan,
                 all_api_keys,
                 workers,
                 model,
@@ -1998,7 +2479,7 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
         """将选中图像的参数填充到表单"""
         if not image_path or image_path not in image_metadata:
             # 返回足够数量的gr.update()
-            return [gr.update()] * 15
+            return [gr.update()] * 23
         
         metadata = image_metadata[image_path]
         source_images = metadata.get('source_images', [])
@@ -2007,10 +2488,12 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
         valid_images = [img for img in source_images if os.path.exists(img)]
         
         if not valid_images:
-            return [gr.update()] * 15
+            return [gr.update()] * 23
         
+        prompt_text = metadata.get('prompt', '')
+
         return (
-            valid_images,                             # page1_files（填充到页面1）
+            valid_images,                             # page1_files（填充到图像1）
             valid_images,                             # page1_gallery
             [],                                       # page2_files（清空）
             [],                                       # page2_gallery（清空）
@@ -2020,7 +2503,15 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
             [],                                       # page4_gallery（清空）
             [],                                       # page5_files（清空）
             [],                                       # page5_gallery（清空）
-            metadata.get('prompt', ''),               # prompts_input
+            prompt_text,                              # prompt1_text
+            "相乘",                                   # prompt1_mode
+            False,                                    # prompt1_inherit
+            "",                                      # prompt2_text
+            "相乘",                                   # prompt2_mode
+            False,                                    # prompt2_inherit
+            "",                                      # prompt3_text
+            "相乘",                                   # prompt3_mode
+            False,                                    # prompt3_inherit
             gr.update(),                              # main_key 保持不变
             gr.update(),                              # backup_keys 保持不变
             metadata.get('model', 'nano-banana-fast'), # model_input
@@ -2041,7 +2532,9 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
             page4_gallery,
             page5_files,
             page5_gallery,
-            prompts_input,
+            prompt1_text, prompt1_mode, prompt1_inherit,
+            prompt2_text, prompt2_mode, prompt2_inherit,
+            prompt3_text, prompt3_mode, prompt3_inherit,
             main_key_input,
             backup_keys_input,
             model_input,
@@ -2083,7 +2576,7 @@ with gr.Blocks(title="Banana 图像生成", theme=gr.themes.Soft()) as demo:
     **多图分组模式（新）**:
     - 支持最多5个页面，每页独立上传图像
     - **所有页面的图像会组合成一个数组提交给API**
-    - 例如：页面1有2张图，页面2有3张图 → API接收5张图的URL数组
+    - 例如：图像1有2张图，图像2有3张图 → API接收5张图的URL数组
     - K个提示词 = K个任务（所有图像一起处理）
     - 适合需要组合多张图像的场景
     
